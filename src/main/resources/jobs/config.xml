@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:bt="http://www.springframework.org/schema/batch" xmlns:aop="http://www.springframework.org/schema/aop"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:context="http://www.springframework.org/schema/context"
+	xmlns:jdbc="http://www.springframework.org/schema/jdbc" xmlns:task="http://www.springframework.org/schema/task"
+	xsi:schemaLocation="http://www.springframework.org/schema/aop http://www.springframework.org/schema/aop/spring-aop.xsd
+              http://www.springframework.org/schema/batch http://www.springframework.org/schema/batch/spring-batch.xsd
+              http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-4.2.xsd
+              http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+              http://www.springframework.org/schema/jdbc http://www.springframework.org/schema/jdbc/spring-jdbc.xsd
+              http://www.springframework.org/schema/task http://www.springframework.org/schema/task/spring-task-4.3.xsd">
+
+	<context:property-placeholder
+		properties-ref="defaultValues" />
+
+	<bean id="defaultValues"
+		class="org.springframework.beans.factory.config.PropertiesFactoryBean">
+		<property name="properties">
+			<props>
+				<prop key="batch.chunk.size">30</prop>
+				<prop key="batch.fetch.size">30</prop>
+				<prop key="batch.page.size">3</prop>
+				<prop key="batch.retry.limit">2</prop>
+				<prop key="batch.skip.limit">1</prop>
+				<prop key="reader">reader</prop>
+				<prop key="writer">writer</prop>
+				<prop key="PARAM_KEY"></prop>
+			</props>
+		</property>
+	</bean>
+
+	<import resource="abstractJobsAndSteps.xml" />
+	
+	<bean id="paramPromotionListener"
+		class="org.springframework.batch.core.listener.ExecutionContextPromotionListener">
+		<property name="keys">
+			<list>
+				<value>${PARAM_KEY}</value>
+			</list>
+		</property>
+	</bean>
+
+	<bt:job id="readDBWriteKafkaAndDb" parent="absRunOnce">
+
+	<bt:step id="setUp" parent="listenersParentStep"
+		allow-start-if-complete="true" next="stepReadDBWriteKafkaAndDb">
+		<bt:tasklet ref="setUpTaskLet">
+			<bt:listeners merge="true">
+				<bt:listener ref="secondProcessor" />
+			</bt:listeners>
+		</bt:tasklet>
+	</bt:step>
+
+	<bt:step id="stepReadDBWriteKafkaAndDb"
+		allow-start-if-complete="true" parent="listenersParentStep" next="dummyTaskLet">
+		<bt:tasklet>
+			<bt:chunk commit-interval="${batch.chunk.size}" reader="${reader}"
+				writer="${writer}" processor="compositeProcessor" retry-limit="${batch.retry.limit}"
+				skip-limit="${batch.skip.limit}">
+				<bt:retryable-exception-classes>
+					<bt:include class="java.lang.Exception" />
+				</bt:retryable-exception-classes>
+				<bt:skippable-exception-classes>
+					<bt:include class="java.lang.Exception" />
+				</bt:skippable-exception-classes>
+			</bt:chunk>
+			<bt:listeners merge="true">
+				<bt:listener ref="taskLet" />
+			</bt:listeners>
+		</bt:tasklet>
+	</bt:step>
+
+	<bt:step id="dummyTaskLet" parent="listenersParentStep"
+		allow-start-if-complete="true">
+		<bt:tasklet ref="taskLet" />
+	</bt:step>
+
+	</bt:job>
+
+	<bean id="taskLet" class="com.tasklet.DummyTasklet" />
+	<bean id="setUpTaskLet" class="com.tasklet.SetUpTasklet" />
+
+	<bean id="reader"
+		class="org.springframework.batch.item.database.JdbcCursorItemReader"
+		scope="step">
+		<property name="dataSource" ref="dataSource" />
+		<property name="rowMapper">
+			<bean class="org.springframework.jdbc.core.ColumnMapRowMapper" />
+		</property>
+		<property name="sql" value="${selectSql}" />
+	</bean>
+
+	<bean id="compositeProcessor"
+		class="org.springframework.batch.item.support.CompositeItemProcessor"
+		scope="step">
+		<property name="delegates">
+			<list>
+				<ref bean="firstProcessor" />
+				<ref bean="secondProcessor" />
+			</list>
+		</property>
+	</bean>
+
+	<bean id="firstProcessor" class="com.processor.FirstProcessor" />
+	<bean id="secondProcessor" class="com.processor.SecondProcessor" />
+
+	<bean id="writer"
+		class="org.springframework.batch.item.support.CompositeItemWriter"
+		scope="step">
+		<property name="delegates">
+			<list>
+				<ref bean="itemW" />
+				<ref bean="kafkaWriter" />
+			</list>
+		</property>
+	</bean>
+
+	<bean id="itemW"
+		class="org.springframework.batch.item.database.JdbcBatchItemWriter"
+		scope="step">
+		<property name="dataSource" ref="outputDataSource" />
+		<property name="sql">
+			<value><![CDATA[
+		 merge into target_profile using dual on (user_id= :USERID) when matched then update set profile_id= :PROFILE
+		 when not matched then insert (user_id,profile_id) values (:USERID,:PROFILE)
+		 ]]></value>
+		</property>
+	</bean>
+
+	<bean id="kafkaWriter" class="com.kafka.writers.MessageSenderInBatchToKafka" />
+
+	<bean id="dataSource" class="org.apache.commons.dbcp2.BasicDataSource"
+		destroy-method="close">
+		<property name="driverClassName" value="${spring.dataSource.driver.class}" />
+		<property name="url" value="${spring.dataSource.url}" />
+	</bean>
+
+	<jdbc:initialize-database data-source="dataSource">
+		<jdbc:script location="classpath:jobs/schema-source.sql" />
+		<!-- <jdbc:script location="org/springframework/batch/core/schema-drop-hsqldb.sql" 
+			/> <jdbc:script location="org/springframework/batch/core/schema-hsqldb.sql" 
+			/> -->
+	</jdbc:initialize-database>
+
+	<bean id="outputDataSource" class="org.apache.commons.dbcp2.BasicDataSource"
+		destroy-method="close">
+		<property name="driverClassName" value="${spring.outputDataSource.driver.class}" />
+		<property name="url" value="${spring.outputDataSource.url}" />
+	</bean>
+
+	<jdbc:initialize-database data-source="outputDataSource">
+		<jdbc:script location="classpath:jobs/schema-target.sql" />
+	</jdbc:initialize-database>
+
+	<bean id="jobLauncher"
+		class="org.springframework.batch.core.launch.support.SimpleJobLauncher">
+		<property name="jobRepository" ref="jobRepo" />
+	</bean>
+
+	<bean id="jobRepo"
+		class="org.springframework.batch.core.repository.support.JobRepositoryFactoryBean">
+		<property name="dataSource" ref="dataSource" />
+		<property name="transactionManager" ref="transactionManager" />
+		<property name="databaseType" value="hsql" />
+	</bean>
+
+	<bean id="transactionManager"
+		class="org.springframework.batch.support.transaction.ResourcelessTransactionManager" />
+		
+	<!-- use below 2 instead of above 2 when you will use persistent database like oracle  instead of in memory hsqldb 
+			to store spring batch job's metadata tables -https://docs.spring.io/spring-batch/3.0.x/reference/html/metaDataSchema.html
+
+	<bean id="jobRepo"
+		class="org.springframework.batch.core.repository.support.JobRepositoryFactoryBean">
+		<property name="isolationLevelForCreate" value="ISOLATION_READ_COMMITTED" />
+		<property name="transactionManager" ref="transactionManager" />
+		<property name="dataSource" ref="dataSource" />
+	</bean>
+
+	<bean id="transactionManager"
+		class="org.springframework.jdbc.datasource.DataSourceTransactionManager" >
+		<property name="dataSource" ref="dataSource" />
+	</bean>
+	-->
+
+	<!-- https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/scheduling/support/CronSequenceGenerator.html -->
+	<task:scheduled-tasks>
+		<task:scheduled ref="scheduler" method="run" initial-delay="90000"
+			fixed-delay="60000" />
+	</task:scheduled-tasks>
+
+	<bean id="scheduler" class="com.util.RunScheduler" />
+</beans>
